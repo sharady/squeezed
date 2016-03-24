@@ -346,9 +346,9 @@ module Domain = struct
   let get_domain_stuck cnx domid = 
 	try 
 		match (read cnx domid _domain_stuck) with 
-		| "true" -> true
-		| _ -> false
-	with Xs_protocol.Enoent _ -> false
+		| a -> (int_of_string a)
+		| _ -> 0
+	with Xs_protocol.Enoent _ -> 0
 
   (** Set a domain's maxmem. Don't throw an exception if the domain has been destroyed *)
   let set_maxmem_noexn cnx domid target_kib = 
@@ -625,7 +625,7 @@ let io ~xc ~verbose = {
   execute_action = (fun action -> execute_action ~xc action);
   target_host_free_mem_kib = target_host_free_mem_kib;
   free_memory_tolerance_kib = free_memory_tolerance_kib;
-  declare_domain_stuck = (fun domid -> set_domain_stuck ~xc domid "true");
+  declare_domain_stuck = (fun domid -> set_domain_stuck ~xc domid "1");
 }
 
 let change_host_free_memory ~xc required_mem_kib success_condition = 

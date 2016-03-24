@@ -60,8 +60,8 @@ type domain = {
 	domid: int;
 	(** true if the domain has ballooning capability i.e. is not paused etc. *)
 	can_balloon: bool;
-	(** true if the domain has been declared stuck by squeezed *)
-	is_stuck: bool;
+	(** count for number of times the domain has been declared stuck by squeezed *)
+	is_stuck: int;
 	(** admin-imposed lower-limit on the balloon target *)
 	dynamic_min_kib: int64;
 	(** current balloon target requested by the system *)
@@ -95,7 +95,7 @@ let domain_to_string_pairs (x: domain) =
 	[
 		"domid", i x.domid;
 		"can_balloon", string_of_bool x.can_balloon;
-		"is_stuck", string_of_bool x.is_stuck;
+		"is_stuck", i x.is_stuck;
 		"dynamic_min_kib", i64 x.dynamic_min_kib;
 		"target_kib", i64 x.target_kib;
 		"dynamic_max_kib", i64 x.dynamic_max_kib;
@@ -181,10 +181,14 @@ let direction_of_int64 a b = if a = b then None else (if a > b then Some Down el
 let has_hit_target inaccuracy_kib memory_actual_kib target_kib = 
   direction_of_actual inaccuracy_kib memory_actual_kib target_kib = None
 
+let reached_max_stuck_attempts is_stuck =
+  let max_attempts = 5 in
+  if is_stuck > max_attempts then true else false
+
 let short_string_of_domain domain = 
   Printf.sprintf "%d T%Ld A%Ld M%Ld %s%s" domain.domid
     domain.target_kib domain.memory_actual_kib domain.memory_max_kib
-    (if (domain.can_balloon && not domain.is_stuck) then "B" else if (domain.can_balloon && domain.is_stuck) then "X" else "?")
+    (if (domain.can_balloon && not (reached_max_stuck_attempts domain.is_stuck)) then "B" else if (domain.can_balloon && (reached_max_stuck_attempts domain.is_stuck)) then "X" else "?")
     (string_of_direction (direction_of_actual domain.inaccuracy_kib domain.memory_actual_kib domain.target_kib))
 
 (** Generic code to guesstimate if a balloon driver is stuck *)
@@ -202,7 +206,7 @@ module Stuckness_monitor = struct
 	type per_domain_state = {
 		mutable last_actual_kib: int64; (** last value of memory actual seen *)
 		mutable last_makingprogress_time: float; (** last time we saw progress towards the target *)
-		mutable stuck: bool; 
+		mutable stuck: int; 
 	}
 	type t = {
 		per_domain: (int, per_domain_state) Hashtbl.t;
@@ -222,7 +226,7 @@ module Stuckness_monitor = struct
 				   (* new domains are considered to be making progress now and not stuck *)
 				   { last_actual_kib = domain.memory_actual_kib;
 					 last_makingprogress_time = now;
-					 stuck = false };
+					 stuck = 0 };
 				 let state = Hashtbl.find x.per_domain domain.domid in
 				 let delta_actual = domain.memory_actual_kib -* state.last_actual_kib in
 				 state.last_actual_kib <- domain.memory_actual_kib;
@@ -230,17 +234,17 @@ module Stuckness_monitor = struct
 				 let makingprogress = (delta_actual > 0L && direction = Some Down) || (delta_actual < 0L && direction = Some Up) in
 				 (* We keep track of the last time we were makingprogress. If we are makingprogress now 
 					then we are not stuck. *)
-				 if makingprogress && not state.stuck then begin
+				 if makingprogress && not (reached_max_stuck_attempts state.stuck) then begin
 				   state.last_makingprogress_time <- now;
-				   state.stuck <- false;
+				   state.stuck <- 0;
 				 end;
 				 (* If there is a request (ie work to do) and we haven't been makingprogress for more than the
-					assume_balloon_driver_stuck_after then declare this domain stuck. *)
+					assume_balloon_driver_stuck_after then increase the stuck attempts for this domain. *)
 				 let request = direction <> None in (* ie target <> actual *)
 				 if request && (now -. state.last_makingprogress_time > assume_balloon_driver_stuck_after)
 				 then begin 
 				 	debug "domain = %d is marked stuck" domain.domid;
-				 	state.stuck <- true;
+				 	state.stuck <- 1;
 					end;
 			)
 			host.domains;
@@ -260,7 +264,7 @@ module Stuckness_monitor = struct
 	let domid_is_active (x: t) domid (now: float) = 
 	  if not (Hashtbl.mem x.per_domain domid)
 	  then false (* it must have been destroyed *)
-	  else not (Hashtbl.find x.per_domain domid).stuck
+	  else not (reached_max_stuck_attempts (Hashtbl.find x.per_domain domid).stuck)
 end
 
 type fistpoint = 
@@ -345,7 +349,7 @@ module Squeezer = struct
 		Stuckness_monitor.update x.stuckness host now;
 		let active_domains = 
 		  List.filter (fun domain ->
-				 domain.can_balloon && not domain.is_stuck
+				 domain.can_balloon && not (reached_max_stuck_attempts domain.is_stuck)
 				 && (Stuckness_monitor.domid_is_active x.stuckness domain.domid now))
 			host.domains in
 		let non_active_domids = List.map (fun d -> d.domid) (set_difference host.domains active_domains) in
@@ -597,7 +601,7 @@ let free_memory_range ?fistpoints io min_kib max_kib =
   (* First compute the 'ideal' amount of free memory based on the proportional allocation policy *)
   let domain = { domid = -1;
 		 can_balloon = true;
-		 is_stuck = false;
+		 is_stuck = 0;
 		 dynamic_min_kib = min_kib; dynamic_max_kib = max_kib;
 		 target_kib = min_kib;
 		 memory_actual_kib = 0L;
